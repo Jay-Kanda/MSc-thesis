@@ -1,0 +1,1031 @@
+---
+title: "Altemeyer setting"
+output: pdf_document
+date: "2025-07-29"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+Load required libraries
+```{r}
+library(coda)
+library(ggplot2)
+library(gridExtra)
+library(dplyr)
+```
+
+
+Data simulation function
+```{r}
+# ij entry of basis matrix is e_j(X_i)
+Phi <- function(theta, basis_matrix){
+  return(as.vector(basis_matrix %*% theta))
+}
+
+# Canonical link for logistic regression
+sigmoid <- function(x){
+  1/(1+exp(-x))
+}
+
+generate_data <- function(d_true, n, theta_true, seed=101){
+  set.seed(seed)
+  X <- runif(n)
+  basis_matrix_true <- sin(pi * outer(X, 1:d_true, FUN="*"))
+  Y_given_X_mean <- sigmoid(Phi(theta_true, basis_matrix_true))  # Bernoulli mean for each Y_i
+  Y <- rbinom(n=n, size=1, prob=Y_given_X_mean)
+  
+  return(list(X=X, Y=Y))
+}
+```
+
+
+Define grad(f) and log(pi) which are needed for MCMC algorithms
+```{r}
+gradient_f <- function(theta, basis_matrix, Y, Sigma_inv){
+  prior_term <- Sigma_inv %*% theta
+  residuals <- Y - sigmoid(Phi(theta, basis_matrix))
+  log_lik_term <- -crossprod(basis_matrix, residuals)
+  return(prior_term + log_lik_term)
+}
+
+# Unnormalized log prior
+log_prior <- function(theta, Sigma_inv){
+  -0.5 * t(theta) %*% Sigma_inv %*% theta
+}
+
+A <- function(x){
+  log(1+exp(x))
+}
+
+log_likelihood <- function(theta, basis_matrix, Y){
+  sum(Phi(theta, basis_matrix)*Y - A(Phi(theta, basis_matrix)))
+}
+
+# log_target can be unnormalised as constants cancel in acceptance probability
+log_target <- function(theta, basis_matrix, Y, Sigma_inv){
+  log_prior(theta, Sigma_inv) + log_likelihood(theta, basis_matrix, Y)
+}
+```
+
+
+ULA algorithm
+```{r}
+ula_sampler <- function(initial_theta, n_iterations, h, gradient_f,
+                        basis_matrix, Y, Sigma_inv){
+  d <- length(initial_theta)
+  theta_chain <- matrix(NA, nrow=n_iterations, ncol=d)
+  theta_chain[1, ] <- initial_theta
+
+  for (k in 1:(n_iterations - 1)){
+    current_theta <- theta_chain[k, ]
+    grad_f <- gradient_f(current_theta, basis_matrix, Y, Sigma_inv)
+    theta_chain[k + 1, ] <- current_theta - h*grad_f + sqrt(2*h)*rnorm(d)
+  }
+  return(theta_chain)
+}
+```
+
+
+MALA algorithm
+```{r}
+mala_sampler <- function(initial_theta, n_iterations, h, gradient_f, log_target_density,
+                         basis_matrix, Y, Sigma_inv, acceptance_rate=FALSE){
+  d <- length(initial_theta)
+  theta_chain <- matrix(NA, nrow=n_iterations, ncol=d)
+  theta_chain[1, ] <- initial_theta
+  accept_count <- 0
+  current_log_target <- log_target_density(initial_theta, basis_matrix, Y, Sigma_inv)
+
+  for (k in 1:(n_iterations - 1)){
+    current_theta <- theta_chain[k, ]
+    
+    # Generate proposal
+    grad_f_current <- gradient_f(current_theta, basis_matrix, Y, Sigma_inv)
+    proposal_mean <- current_theta - h*grad_f_current
+    z <- rnorm(n=d, mean=proposal_mean, sd=sqrt(2*h))
+    
+    # Compute mean of reverse proposal for acceptance probability calculation
+    grad_f_z <- gradient_f(z, basis_matrix, Y, Sigma_inv)
+    reverse_proposal_mean <- z - h*grad_f_z
+    
+    # Calculate the log-ratio of transition kernels directly
+    forward_dist_sq <- sum((z - proposal_mean)^2)
+    reverse_dist_sq <- sum((current_theta - reverse_proposal_mean)^2)
+    log_q_ratio <- (forward_dist_sq - reverse_dist_sq) / (4*h)
+    
+    # Acceptance probability
+    proposal_log_target <- log_target_density(z, basis_matrix, Y, Sigma_inv)
+    log_acceptance_prob <- proposal_log_target - current_log_target + log_q_ratio
+                           
+    acceptance <- min(1, exp(log_acceptance_prob))
+    
+    # Accept or reject
+    if (runif(1) < acceptance){
+      theta_chain[k + 1, ] <- z
+      accept_count <- accept_count + 1
+      # Only need to update this if a sample is accepted
+      current_log_target <- proposal_log_target
+    } else {
+      theta_chain[k + 1, ] <- current_theta
+    }
+  }
+  
+  if(acceptance_rate==TRUE){
+   cat("MALA Acceptance Rate:", accept_count / (n_iterations-1), "\n") 
+  }
+  return(theta_chain)
+}
+```
+
+
+HMC algorithm
+```{r}
+leapfrog <- function(theta, p, epsilon, L, gradient_f,
+                     basis_matrix, Y, Sigma_inv){
+    p <- p - 0.5*epsilon * gradient_f(theta, basis_matrix, Y, Sigma_inv)
+    
+    for (step in 1:L){
+      theta <- theta + epsilon * p
+      if (step < L) {
+        p <- p - epsilon * gradient_f(theta, basis_matrix, Y, Sigma_inv)
+      }
+    }
+    
+    p <- p - 0.5*epsilon * gradient_f(theta, basis_matrix, Y, Sigma_inv)
+    return(list(theta = theta, p = p))
+}
+
+hmc_sampler <- function(initial_theta, n_iterations, epsilon, L,
+                        log_target_density, gradient_f, basis_matrix, Y,
+                        Sigma_inv, acceptance_rate=FALSE){
+  
+  d <- length(initial_theta)
+  theta_chain <- matrix(NA, nrow=n_iterations, ncol=d)
+  theta_chain[1, ] <- initial_theta
+  accept_count <- 0
+  
+  for (k in 1:(n_iterations - 1)){
+    current_theta <- theta_chain[k, ]
+    
+    # Sample random momentum from N(0, I_d)
+    current_p <- rnorm(d)
+    
+    # Simulate Hamiltonian dynamics using Leapfrog
+    leapfrog_result <- leapfrog(current_theta, current_p, epsilon, L, gradient_f,
+                                basis_matrix, Y, Sigma_inv)
+    proposed_theta <- leapfrog_result$theta
+    proposed_p <- leapfrog_result$p
+    
+    # Calculate Hamiltonian for current and proposed states
+    current_H <- -log_target_density(current_theta, basis_matrix, Y, Sigma_inv)
+                 + 0.5*sum(current_p^2)
+    proposed_H <- -log_target_density(proposed_theta, basis_matrix, Y, Sigma_inv)
+                  + 0.5*sum(proposed_p^2)
+    
+    # Metropolis-Hastings acceptance ratio
+    alpha <- min(1, exp(current_H-proposed_H))
+    
+    # Accept or reject
+    if (runif(1) < alpha){
+      theta_chain[k + 1, ] <- proposed_theta
+      accept_count <- accept_count + 1
+    } 
+    else{
+      theta_chain[k + 1, ] <- current_theta
+    }
+  }
+
+  if(acceptance_rate==TRUE){
+   cat("HMC Acceptance Rate:", accept_count / (n_iterations-1), "\n") 
+  }
+  return(theta_chain)
+}
+```
+
+
+
+
+
+
+
+Define surrogate log-likelihood
+```{r}
+# Smooth step function
+g <- function(x) {
+  smooth_step <- 1 / (1 + exp((1 - 2*x) / (x * (1 - x))))
+  
+  result <- ifelse(x <= 0, 
+                   0,
+                   ifelse(x < 1, 
+                          smooth_step,
+                          1))
+  return(result)
+}
+
+# Cut-off function
+v <- function(x){
+  1-g(8*(x-0.75))
+}
+
+# Define mollifier
+phi_unnormalised <- function(x){
+  g(1+x)*g(1-x)
+}
+
+phi_normalising_constant <- integrate(phi_unnormalised, -1, 1)$value
+
+phi <- function(x){
+  phi_unnormalised(x)/phi_normalising_constant
+}
+
+phi_t <- function(x, t){
+  phi(x/t)/t
+}
+
+
+gamma_eta <- function(t, eta){
+  ifelse(t<=5*eta/8,
+         0,
+         (t-5*eta/8)^2)
+}
+
+v_eta <- function(t, eta) {
+  # Computes the value of v_eta(t_val)
+  convolution <- function(t_val) {
+    # Integrand in convolution integral
+    integrand <- function(tau) {
+      phi_t(tau, eta/8) * gamma_eta(t_val-tau, eta)
+    }
+
+    # Support of phi_t(tau, eta/8) is (-eta/8, eta/8),
+    integral_result <- integrate(
+      f = integrand,
+      lower = -eta/8,
+      upper = eta/8
+    )
+    
+    return(integral_result$value)
+  }
+  
+  # Compute v_eta for each value of a vector t
+  sapply(t, convolution)
+}
+
+surrogate_log_likelihood <- function(theta, theta_init, eta, basis_matrix, Y, K){
+  d <- sqrt(sum((theta-theta_init)^2))
+  
+  v(d/eta) * (log_likelihood(theta, basis_matrix, Y)-log_likelihood(theta_init, basis_matrix, Y)) +
+  log_likelihood(theta_init, basis_matrix, Y) - K*v_eta(d, eta)
+}
+```
+
+
+Define gradient of surrogate log-likelihood
+```{r}
+# Derivative of g
+dg <- function(x){
+  exp_term <- exp( (1-2*x) / (x*(1-x)) )
+  frac <- (-2*x^2 + 2*x -1)/(x^2 * (1-x)^2)
+  derivative <- -frac * exp_term * (1+exp_term)^(-2)
+  
+  # Truncate from (0, 1) to (0.08, 0.92) to avoid division by 0 errors
+  ifelse(x<=0.08|x>=0.92, 0, derivative)
+}
+
+# Derivative of v
+dv <- function(x){
+  -8*dg(8*(x-3/4))
+}
+
+# Derivative of gamma_eta
+d_gamma_eta <- function(x, eta){
+  ifelse(x<= 5*eta/8,
+         0,
+         2*(x-5*eta/8))
+}
+
+# Derivative of v_eta
+dv_eta <- function(t, eta){
+  # Computes the value of dv_eta(t_val)
+  convolution <- function(t_val) {
+    # Integrand in convolution integral
+    integrand <- function(tau) {
+      phi_t(tau, eta/8) * d_gamma_eta(t_val-tau, eta)
+    }
+
+    # Support of phi_t(tau, eta/8) is (-eta/8, eta/8),
+    integral_result <- integrate(
+      f = integrand,
+      lower = -eta/8,
+      upper = eta/8
+    )
+    
+    return(integral_result$value)
+  }
+  
+  # Compute v_eta for each value of a vector t
+  sapply(t, convolution)
+}
+
+
+gradient_surrogate_log_likelihood <- function(theta, theta_init, basis_matrix, Y, eta, K){
+  d <- sqrt(sum((theta-theta_init)^2))
+  # Gradient of the true log likelihood at theta
+  grad_llk <- crossprod(basis_matrix, Y - sigmoid(Phi(theta, basis_matrix)))
+  
+  # Handle the edge case where theta is close to initial point and d->0
+  if (d < .Machine$double.eps) {
+    # Gradient is just the gradient of the true log-likelihood
+    return(grad_llk)
+  }
+  
+  term1 <- v(d/eta) * grad_llk
+  term2 <- (log_likelihood(theta, basis_matrix, Y) - log_likelihood(theta_init, basis_matrix, Y))/eta * dv(d/eta)
+  term3 <- -K * dv_eta(d, eta)
+  
+  return( term1 + (theta-theta_init)/d * (term2+term3) )
+}
+```
+
+
+
+Define grad(f) and log(pi) for the surrogate posterior
+```{r}
+gradient_f_surrogate <- function(theta, basis_matrix, Y, Sigma_inv, theta_init, eta, K){
+  prior_term <- Sigma_inv %*% theta
+  surrogate_log_lik_term <- -gradient_surrogate_log_likelihood(theta, theta_init, basis_matrix, Y, eta, K)
+  return(prior_term + surrogate_log_lik_term)
+}
+
+# log_target can be unnormalised as constants cancel in acceptance probability
+log_target_surrogate <- function(theta, basis_matrix, Y, Sigma_inv, theta_init, eta, K){
+  log_prior(theta, Sigma_inv) + surrogate_log_likelihood(theta, theta_init, eta, basis_matrix, Y, K)
+}
+```
+
+
+Define ULA, MALA and HMC for surrogate.
+All that changes ia arguments for functions associated with posterior.
+```{r}
+ula_sampler_surrogate <- function(initial_theta, n_iterations, h, gradient_f,
+                        basis_matrix, Y, Sigma_inv, eta, K){
+  d <- length(initial_theta)
+  theta_chain <- matrix(NA, nrow=n_iterations, ncol=d)
+  theta_chain[1, ] <- initial_theta
+
+  for (k in 1:(n_iterations - 1)){
+    current_theta <- theta_chain[k, ]
+    grad_f <- gradient_f(current_theta, basis_matrix, Y, Sigma_inv, initial_theta, eta, K)
+    theta_chain[k + 1, ] <- current_theta - h*grad_f + sqrt(2*h)*rnorm(d)
+  }
+  return(theta_chain)
+}
+
+mala_sampler_surrogate <- function(initial_theta, n_iterations, h, gradient_f, log_target_density,
+                         basis_matrix, Y, Sigma_inv, eta, K, acceptance_rate=FALSE){
+  d <- length(initial_theta)
+  theta_chain <- matrix(NA, nrow=n_iterations, ncol=d)
+  theta_chain[1, ] <- initial_theta
+  accept_count <- 0
+  current_log_target <- log_target_density(initial_theta, basis_matrix, Y, Sigma_inv, initial_theta, eta, K)
+
+  for (k in 1:(n_iterations - 1)){
+    current_theta <- theta_chain[k, ]
+    
+    # Generate proposal
+    grad_f_current <- gradient_f(current_theta, basis_matrix, Y, Sigma_inv, initial_theta, eta, K)
+    proposal_mean <- current_theta - h*grad_f_current
+    z <- rnorm(n=d, mean=proposal_mean, sd=sqrt(2*h))
+    
+    # Compute mean of reverse proposal for acceptance probability calculation
+    grad_f_z <- gradient_f(z, basis_matrix, Y, Sigma_inv, initial_theta, eta, K)
+    reverse_proposal_mean <- z - h*grad_f_z
+    
+    # Calculate the log-ratio of transition kernels directly
+    forward_dist_sq <- sum((z - proposal_mean)^2)
+    reverse_dist_sq <- sum((current_theta - reverse_proposal_mean)^2)
+    log_q_ratio <- (forward_dist_sq - reverse_dist_sq) / (4*h)
+    
+    # Acceptance probability
+    proposal_log_target <- log_target_density(z, basis_matrix, Y, Sigma_inv, initial_theta, eta, K)
+    log_acceptance_prob <- proposal_log_target - current_log_target + log_q_ratio
+                           
+    acceptance <- min(1, exp(log_acceptance_prob))
+    
+    # Accept or reject
+    if (runif(1) < acceptance){
+      theta_chain[k + 1, ] <- z
+      accept_count <- accept_count + 1
+      # Only need to update this if a sample is accepted
+      current_log_target <- proposal_log_target
+    } else {
+      theta_chain[k + 1, ] <- current_theta
+    }
+  }
+  
+  if(acceptance_rate==TRUE){
+   cat("MALA Acceptance Rate:", accept_count / (n_iterations-1), "\n") 
+  }
+  return(theta_chain)
+}
+
+
+leapfrog_surrogate <- function(theta, p, epsilon, L, gradient_f,
+                     basis_matrix, Y, Sigma_inv, initial_theta, eta, K){
+    p <- p - 0.5*epsilon * gradient_f(theta, basis_matrix, Y, Sigma_inv, initial_theta, eta, K)
+    
+    for (step in 1:L){
+      theta <- theta + epsilon * p
+      if (step < L) {
+        p <- p - epsilon * gradient_f(theta, basis_matrix, Y, Sigma_inv, initial_theta, eta, K)
+      }
+    }
+    
+    p <- p - 0.5*epsilon * gradient_f(theta, basis_matrix, Y, Sigma_inv, initial_theta, eta, K)
+    return(list(theta = theta, p = p))
+}
+
+hmc_sampler_surrogate <- function(initial_theta, n_iterations, epsilon, L,
+                        log_target_density, gradient_f, basis_matrix, Y,
+                        Sigma_inv, eta, K, acceptance_rate=FALSE){
+  
+  d <- length(initial_theta)
+  theta_chain <- matrix(NA, nrow=n_iterations, ncol=d)
+  theta_chain[1, ] <- initial_theta
+  accept_count <- 0
+  
+  for (k in 1:(n_iterations - 1)){
+    current_theta <- theta_chain[k, ]
+    
+    # Sample random momentum from N(0, I_d)
+    current_p <- rnorm(d)
+    
+    # Simulate Hamiltonian dynamics using Leapfrog
+    leapfrog_result <- leapfrog_surrogate(current_theta, current_p, epsilon, L, gradient_f,
+                                basis_matrix, Y, Sigma_inv, initial_theta, eta, K)
+    proposed_theta <- leapfrog_result$theta
+    proposed_p <- leapfrog_result$p
+    
+    # Calculate Hamiltonian for current and proposed states
+    current_H <- -log_target_density(current_theta, basis_matrix, Y, Sigma_inv, initial_theta, eta, K)
+                 + 0.5*sum(current_p^2)
+    proposed_H <- -log_target_density(proposed_theta, basis_matrix, Y, Sigma_inv, initial_theta, eta, K)
+                  + 0.5*sum(proposed_p^2)
+    
+    # Metropolis-Hastings acceptance ratio
+    alpha <- min(1, exp(current_H-proposed_H))
+    
+    # Accept or reject
+    if (runif(1) < alpha){
+      theta_chain[k + 1, ] <- proposed_theta
+      accept_count <- accept_count + 1
+    } 
+    else{
+      theta_chain[k + 1, ] <- current_theta
+    }
+  }
+
+  if(acceptance_rate==TRUE){
+   cat("HMC Acceptance Rate:", accept_count / (n_iterations-1), "\n") 
+  }
+  return(theta_chain)
+}
+```
+
+
+
+
+
+Plot g, v, phi and v_eta
+```{r}
+# Compute data for each plot
+g_data <- data.frame(x = seq(-0.5, 1.5, 0.01))
+g_data$y <- g(g_data$x)
+
+v_data <- data.frame(x = seq(-0.5, 2, 0.01))
+v_data$y <- v(v_data$x)
+
+phi_data <- data.frame(x = seq(-1.5, 1.5, 0.01))
+phi_data$y <- phi(phi_data$x)
+
+v_eta_data <- data.frame(x = seq(-1, 10, 0.01))
+eta <- 1
+v_eta_data$y <- v_eta(v_eta_data$x, 1)
+
+# Create the individual ggplots
+g_plot <- ggplot(g_data, aes(x = x, y = y)) +
+  geom_line() +
+  labs(x='x', y=expression(g(x))) +
+  theme_minimal() +
+  theme(panel.border = element_rect(colour = "black", fill=NA),
+        axis.title = element_text(size = 25),
+        axis.text = element_text(size = 20))
+
+v_plot <- ggplot(v_data, aes(x = x, y = y)) +
+  geom_line() +
+  labs(x='x', y=expression(v(x))) +
+  theme_minimal() +
+  theme(panel.border = element_rect(colour = "black", fill=NA),
+        axis.title = element_text(size = 25),
+        axis.text = element_text(size = 20))
+
+phi_plot <- ggplot(phi_data, aes(x = x, y = y)) +
+  geom_line() +
+  labs(x='x', y=expression(phi(x))) +
+  theme_minimal() +
+  theme(panel.border = element_rect(colour = "black", fill=NA),
+        axis.title = element_text(size = 25),
+        axis.text = element_text(size = 20))
+
+v_eta_plot <- ggplot(v_eta_data, aes(x = x, y = y)) +
+  geom_line() +
+  labs(x='x', y=expression(v[1](x))) +
+  theme_minimal() +
+  theme(panel.border = element_rect(colour = "black", fill=NA),
+        axis.title = element_text(size = 25),
+        axis.text = element_text(size = 20))
+
+# Save plots
+#ggsave("g_plot.pdf", plot=g_plot, width = 10, height = 4, units = "in", dpi = 300)
+#ggsave("v_plot.pdf", plot=v_plot, width = 10, height = 4, units = "in", dpi = 300)
+#ggsave("phi_plot.pdf", plot=phi_plot, width = 10, height = 4, units = "in", dpi = 300)
+#ggsave("v_eta_plot.pdf", plot=v_eta_plot, width = 10, height = 4, units = "in", dpi = 300)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Run experiments for first setting
+```{r}
+# Generate data
+d_true <- 100
+theta_true <- 1/c(1:d_true)
+n <- 250
+dataset <- generate_data(d_true, n, theta_true, seed=101)
+X <- dataset$X
+Y <- dataset$Y
+
+d <- 5
+basis_matrix <- sin(pi * outer(X, 1:d, FUN = "*"))
+alpha <- 1
+Sigma_alpha <- diag(c(1:d)^(2*alpha))
+beta <- 1
+prior_cov_inverse <- beta * Sigma_alpha
+eta <- 0.5
+K <- 67
+n_iterations <- 2000
+burnin <- 1
+initial_theta <- theta_true[1:d]
+
+
+# Compute diagnostics for a chain
+diagnostics <- function(chain, lags=c(0:10)){
+  list(ESS=effectiveSize(chain),
+       mean_estimate=mean(chain),
+       conf_int=quantile(chain, probs=c(0.025, 0.975)),
+       acf=autocorr(chain, lags))
+}
+
+
+
+
+# h_ula <- 0.03
+# ula_chain <- mcmc(ula_sampler(initial_theta, n_iterations, h_ula, gradient_f, basis_matrix, Y, prior_cov_inverse)[burnin:n_iterations,1])
+# diagnostics(ula_chain)
+
+# h_ula_surr <- 0.0135
+# ula_chain_surr <- mcmc(ula_sampler_surrogate(initial_theta, n_iterations, h_ula_surr, gradient_f_surrogate, basis_matrix, Y, prior_cov_inverse, eta, K)[burnin:n_iterations,1])
+# diagnostics(ula_chain_surr)
+
+
+
+
+
+# h_mala <- 0.02
+# mala_chain <- mcmc(mala_sampler(initial_theta, n_iterations, h_mala, gradient_f, log_target, basis_matrix, Y, prior_cov_inverse, TRUE)[burnin:n_iterations,1])
+# diagnostics(mala_chain)
+
+# h_mala_surr <- 0.02
+# mala_chain_surr <- mcmc(mala_sampler_surrogate(initial_theta, n_iterations, h_mala_surr, gradient_f_surrogate, log_target_surrogate, basis_matrix, Y, prior_cov_inverse, eta, K, TRUE)[burnin:n_iterations,1])
+# diagnostics(mala_chain_surr)
+
+
+
+
+# epsilon <- 0.05
+# L <- 8
+# hmc_chain <- mcmc(hmc_sampler(initial_theta, n_iterations, epsilon, L, log_target, gradient_f, basis_matrix, Y, prior_cov_inverse, TRUE)[burnin:n_iterations,1])
+# diagnostics(hmc_chain)
+
+# epsilon <- 0.03
+# L <- 15
+# hmc_chain_surr <- mcmc(hmc_sampler_surrogate(initial_theta, n_iterations, epsilon, L, log_target_surrogate, gradient_f_surrogate, basis_matrix, Y, prior_cov_inverse, eta, K, TRUE)[burnin:n_iterations,1])
+# diagnostics(hmc_chain_surr)
+```
+
+
+
+
+
+
+
+
+
+Experiment with initalization. 
+
+Generate data and initialize variables needed.
+```{r}
+# Generate data
+d_true <- 100
+theta_true <- 1/c(1:d_true)
+n <- 250
+dataset <- generate_data(d_true, n, theta_true, seed=102)
+X <- dataset$X
+Y <- dataset$Y
+
+d <- 5
+basis_matrix <- sin(pi * outer(X, 1:d, FUN = "*"))
+alpha <- 1
+Sigma_alpha <- diag(c(1:d)^(2*alpha))
+beta <- 1
+prior_cov_inverse <- beta * Sigma_alpha
+n_iterations <- 2000
+burnin <- 1
+initial_theta <- theta_true[1:d]
+
+eta <- 0.5
+K <- 67
+```
+
+Plotting function
+```{r}
+trace_plot_function <- function(ula_true, ula_surr, ground_truth, n, i){
+  plot_data <- data.frame(
+  Iteration = 1:n,
+  Value = c(ula_true, ula_surr),
+  Sampler = rep(c("True Posterior", "Surrogate Posterior"), each=n)
+  )
+
+  ggplot(data=plot_data, aes(x=Iteration, y=Value, color=Sampler)) +
+    geom_line(lwd=0.1) +
+    geom_hline(aes(yintercept = ground_truth, color = "Ground Truth"), linewidth = 0.5) +
+    scale_color_manual(
+      values = c("True Posterior" = "black", "Surrogate Posterior" = "blue", "Ground Truth" = "red"),
+      labels = c("True Posterior" = "True Posterior", 
+                 "Surrogate Posterior" = "Surrogate Posterior", 
+                 "Ground Truth" = bquote(theta[.(paste(0, i, sep =","))]))
+    ) +
+    labs(x = "Iteration", y = bquote(theta[.(i)]),
+      color = "") +
+    theme_minimal() +
+    theme(panel.border = element_rect(colour = "black", fill=NA),
+          axis.title = element_text(size = 25),
+          axis.text = element_text(size = 20),
+          legend.text = element_text(size = 20))
+}
+```
+
+Ground truth
+```{r}
+h_ula <- 0.03
+ula_chain <- mcmc(ula_sampler(initial_theta, n_iterations, h_ula, gradient_f, basis_matrix, Y, prior_cov_inverse)[burnin:n_iterations,])
+
+h_ula_surr <- 0.0135
+ula_chain_surr <- mcmc(ula_sampler_surrogate(initial_theta, n_iterations, h_ula_surr, gradient_f_surrogate, basis_matrix, Y, prior_cov_inverse, eta, K)[burnin:n_iterations,])
+
+ground_truth_1 <- trace_plot_function(ula_chain[,1], ula_chain_surr[,1], theta_true[1], n_iterations, 1)
+ground_truth_5 <- trace_plot_function(ula_chain[,5], ula_chain_surr[,5], theta_true[5], n_iterations, 5)
+```
+
+Ground truth plus small noise that only perturbs first parameter by 1
+```{r}
+set.seed(5)
+small_noise <- c(1, 0, 0, 0, 1)
+
+h_ula <- 0.03
+ula_chain <- mcmc(ula_sampler(initial_theta+small_noise, n_iterations, h_ula, gradient_f, basis_matrix, Y, prior_cov_inverse)[burnin:n_iterations,])
+
+h_ula_surr <- 0.0135
+ula_chain_surr <- mcmc(ula_sampler_surrogate(initial_theta+small_noise, n_iterations, h_ula_surr, gradient_f_surrogate, basis_matrix, Y, prior_cov_inverse, eta, K)[burnin:n_iterations,])
+
+small_noise_1 <- trace_plot_function(ula_chain[,1], ula_chain_surr[,1], theta_true[1], n_iterations, 1)
+small_noise_5 <- trace_plot_function(ula_chain[,5], ula_chain_surr[,5], theta_true[5], n_iterations, 5)
+```
+
+Ground truth plus large noise
+```{r}
+set.seed(22)
+large_noise <- rnorm(d, sd=20)
+
+h_ula <- 0.03
+ula_chain <- mcmc(ula_sampler(initial_theta+large_noise, n_iterations, h_ula, gradient_f, basis_matrix, Y, prior_cov_inverse)[burnin:n_iterations,])
+
+h_ula_surr <- 0.0135
+ula_chain_surr <- mcmc(ula_sampler_surrogate(initial_theta+large_noise, n_iterations, h_ula_surr, gradient_f_surrogate, basis_matrix, Y, prior_cov_inverse, eta, K)[burnin:n_iterations,])
+
+large_noise_1 <- trace_plot_function(ula_chain[,1], ula_chain_surr[,1], theta_true[1], n_iterations, 1)
+large_noise_5 <- trace_plot_function(ula_chain[,5], ula_chain_surr[,5], theta_true[5], n_iterations, 5)
+```
+
+Save plots
+```{r}
+ggsave("ground_truth_1.pdf", plot=ground_truth_1, width = 10, height = 4, units = "in", dpi = 300)
+ggsave("ground_truth_5.pdf", plot=ground_truth_5, width = 10, height = 4, units = "in", dpi = 300)
+ggsave("small_noise_1.pdf", plot=small_noise_1, width = 10, height = 4, units = "in", dpi = 300)
+ggsave("small_noise_5.pdf", plot=small_noise_5, width = 10, height = 4, units = "in", dpi = 300)
+ggsave("large_noise_1.pdf", plot=large_noise_1, width = 10, height = 4, units = "in", dpi = 300)
+ggsave("large_noise_5.pdf", plot=large_noise_5, width = 10, height = 4, units = "in", dpi = 300)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Experiment with model dimension.
+```{r}
+# Generate data
+d_true <- 100
+theta_true <- 1/c(1:d_true)
+n <- 250
+dataset <- generate_data(d_true, n, theta_true, seed=101)
+X <- dataset$X
+Y <- dataset$Y
+
+alpha <- 0.1
+beta <- 1
+n_iterations <- 2000
+burnin <- 1
+eta <- 0.5
+
+# Computes euclidean distance between mean of chain and initial point
+l2_distance <- function(chain, theta_init){
+  dist <- sqrt(sum( (colMeans(chain)-theta_init)^2 ) )
+  round(dist, 2)
+}
+
+# Parameter settings
+d_vals <- c(5, 10, 20, 50 ,100)
+ula_h_vals <- c(0.035, 0.035, 0.04, 0.06, 0.08)
+K_vals <- c(67, 70, 80, 150, 200)
+ula_surr_h_vals <- c(0.0135, 0.012, 0.01, 0.0045, 0.003)
+epsilon_vals <- c(0.045, 0.05, 0.05, 0.04, 0.006)
+L_vals <- c(10, 10, 12, 15, 15)
+
+# Create dataframes to store stats of samplers over different model dimensions
+ula_stats <- data.frame(matrix(nrow=5, ncol=3))
+ula_surr_stats <- data.frame(matrix(nrow=5, ncol=3))
+hmc_stats <- data.frame(matrix(nrow=5, ncol=3))
+# Set column names for these dataframes
+cols <- c("d", "Min_ESS", "Distance to initializer")
+colnames(ula_stats) <- cols
+colnames(ula_surr_stats) <- cols
+colnames(hmc_stats) <- cols
+
+# Lists to store the actual chains
+ula_chains <- list()
+ula_surr_chains <- list()
+hmc_chains <- list()
+
+
+for (i in 1:5){
+  d <- d_vals[i]
+  basis_matrix <- sin(pi * outer(X, 1:d, FUN="*"))
+  Sigma_alpha <- diag(c(1:d)^(2*alpha))
+  prior_cov_inverse <- beta * Sigma_alpha
+  
+  # Add small perturbation to ground truth for initial point
+  noise <- rnorm(d,sd=0.1)
+  noise_norm <- sqrt(sum(noise^2))
+  scaled_noise <- noise/noise_norm * eta/8
+  initial_theta <- theta_true[1:d] + scaled_noise
+  
+  # Run ULA on true posterior and store stats
+  ula_chain <- mcmc(ula_sampler(initial_theta, n_iterations, ula_h_vals[i], gradient_f,
+                                basis_matrix, Y, prior_cov_inverse)[burnin:n_iterations,])
+  min_ESS_ula <- round(min(effectiveSize(ula_chain)))
+  distance_init <- l2_distance(ula_chain, initial_theta)
+  ula_stats[i,] <- c(d, min_ESS_ula, distance_init)
+
+  # Run ULA on surrogate posterior and store stats
+  ula_chain_surr <- mcmc(ula_sampler_surrogate(initial_theta, n_iterations, ula_surr_h_vals[i],
+                                                gradient_f_surrogate, basis_matrix, Y,
+                                                prior_cov_inverse, eta, K_vals[i])[burnin:n_iterations,])
+
+  min_ESS_ula_surr <- round(min(effectiveSize(ula_chain_surr)))
+  distance_init_surr <- l2_distance(ula_chain_surr, initial_theta)
+  ula_surr_stats[i,] <- c(d, min_ESS_ula_surr, distance_init_surr)
+  
+  # Run HMC ontrue posterior and store stats
+  hmc_chain <- mcmc(hmc_sampler(initial_theta, n_iterations, epsilon_vals[i],
+                                L_vals[i], log_target, gradient_f, basis_matrix,
+                                Y, prior_cov_inverse)[burnin:n_iterations,])
+  min_ESS_hmc <- round(min(effectiveSize(hmc_chain)))
+  distance_init_hmc <- l2_distance(hmc_chain, initial_theta)
+  hmc_stats[i,] <- c(d, min_ESS_hmc, distance_init_hmc)
+  
+  ula_chains[[i]] <- ula_chain
+  ula_surr_chains[[i]] <- ula_chain_surr
+  hmc_chains[[i]] <- hmc_chain
+}
+```
+
+
+Min ESS against d plot
+```{r}
+combined_stats <- bind_rows(
+  "ULA true posterior" = ula_stats,
+  "ULA surrogate posterior" = ula_surr_stats,
+  "HMC" = hmc_stats,
+  .id = "source"
+)
+
+min_ESS_plot <- ggplot(combined_stats, aes(x=d, y=Min_ESS, color=source, shape=source)) +
+  geom_line(lwd=1) +
+  geom_point(size=3) +
+  labs(
+    x=expression(d),
+    y="Minimal ESS",
+    color="",
+    shape=""
+  ) +
+  scale_color_manual(values=c("ULA true posterior"="black", "ULA surrogate posterior"="red", "HMC"="blue")) +
+  scale_shape_manual(values=c("ULA true posterior"=16, "ULA surrogate posterior"=17, "HMC"=15)) +
+  theme_minimal() +
+  theme(panel.border = element_rect(colour="black", fill=NA),
+        axis.title = element_text(size=25),
+        axis.text = element_text(size=20),
+        legend.text = element_text(size=20)) +
+  scale_y_continuous(breaks=c(0, 500, 1000, 1500), limits=c(0, 1500))
+
+min_ESS_plot
+#ggsave("min_ESS_d.pdf", plot=min_ESS_plot, width = 10, height = 4, units = "in", dpi = 300)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Experiments with sample size
+```{r}
+# Generate data
+d_true <- 100
+theta_true <- 1/c(1:d_true)
+
+d <- 20
+alpha <- 0.1
+Sigma_alpha <- diag(c(1:d)^(2*alpha))
+beta <- 1
+prior_cov_inverse <- beta * Sigma_alpha
+n_iterations <- 2000
+burnin <- 1
+initial_theta <- theta_true[1:d]
+
+
+# Parameter settings
+n_vals <- c(250, 500, 750, 1000)
+ula_h_vals <- c(0.04, 0.02, 0.012, 0.0095)
+eta_vals <- c(0.5, 0.45, 0.4, 0.35)
+K_vals <- c(80, 85, 90, 95)
+ula_surr_h_vals <- c(0.01, 0.009, 0.009, 0.008)
+epsilon_vals <- c(0.05, 0.05, 0.04, 0.03)
+L_vals <- c(12, 8, 8, 9)
+
+
+
+
+
+# Create dataframes to store stats of samplers over different model dimensions
+ula_stats <- data.frame(matrix(nrow=4, ncol=4))
+ula_surr_stats <- data.frame(matrix(nrow=4, ncol=4))
+hmc_stats <- data.frame(matrix(nrow=4, ncol=4))
+# Set column names for these dataframes
+cols <- c("n", "Min_ESS", "2.5% quantile", "97.5% quantile")
+colnames(ula_stats) <- cols
+colnames(ula_surr_stats) <- cols
+colnames(hmc_stats) <- cols
+
+# Lists to store the actual chains
+ula_chains <- list()
+ula_surr_chains <- list()
+hmc_chains <- list()
+
+
+
+for (i in 1:4){
+  # Generate dataset
+  n <- n_vals[i]
+  dataset <- generate_data(d_true, n, theta_true, seed=18)
+  X <- dataset$X
+  Y <- dataset$Y
+  basis_matrix <- sin(pi * outer(X, 1:d, FUN = "*"))
+  
+  # Add small perturbation to ground truth for initial point
+  noise <- rnorm(d)
+  noise_norm <- sqrt(sum(noise^2))
+  scaled_noise <- noise/noise_norm * eta/8
+  initial_theta <- theta_true[1:d] + scaled_noise
+  
+  # Run ULA on true posterior and store stats
+  ula_chain <- mcmc(ula_sampler(initial_theta, n_iterations, ula_h_vals[i], gradient_f,
+                                basis_matrix, Y, prior_cov_inverse)[burnin:n_iterations,])
+  min_ESS_ula <- round(min(effectiveSize(ula_chain)))
+  lower_quantile <- quantile(ula_chain[,1], probs=(0.025))
+  upper_quantile <- quantile(ula_chain[,1], probs=(0.975))
+  ula_stats[i,] <- c(n, min_ESS_ula, lower_quantile, upper_quantile)
+
+  # Run ULA on surrogate posterior and store stats
+  ula_chain_surr <- mcmc(ula_sampler_surrogate(initial_theta, n_iterations, ula_surr_h_vals[i],
+                                               gradient_f_surrogate, basis_matrix, Y, prior_cov_inverse,
+                                               eta_vals[i], K_vals[i])[burnin:n_iterations,])
+  min_ESS_ula_surr <- round(min(effectiveSize(ula_chain_surr)))
+  lower_quantile_surr <- quantile(ula_chain_surr[,1], probs=(0.025))
+  upper_quantile_surr <- quantile(ula_chain_surr[,1], probs=(0.975))
+  ula_surr_stats[i,] <- c(n, min_ESS_ula_surr, lower_quantile_surr, upper_quantile_surr)
+  
+  # Run HMC ontrue posterior and store stats
+  hmc_chain <- mcmc(hmc_sampler(initial_theta, n_iterations, epsilon_vals[i],
+                                L_vals[i], log_target, gradient_f, basis_matrix,
+                                Y, prior_cov_inverse)[burnin:n_iterations,])
+  min_ESS_hmc <- round(min(effectiveSize(hmc_chain)))
+  lower_quantile_hmc <- quantile(hmc_chain[,1], probs=(0.025))
+  upper_quantile_hmc <- quantile(hmc_chain[,1], probs=(0.975))
+  hmc_stats[i,] <- c(n, min_ESS_hmc, lower_quantile_hmc, upper_quantile_hmc)
+  
+  ula_chains[[i]] <- ula_chain
+  ula_surr_chains[[i]] <- ula_chain_surr
+  hmc_chains[[i]] <- hmc_chain
+}
+```
+
+
+Min ESS against n plot
+```{r}
+combined_stats <- bind_rows(
+  "ULA true posterior" = ula_stats,
+  "ULA surrogate posterior" = ula_surr_stats,
+  "HMC" = hmc_stats,
+  .id = "source"
+)
+
+min_ESS_plot <- ggplot(combined_stats, aes(x=n, y=Min_ESS, color=source, shape=source)) +
+  geom_line(lwd=1) +
+  geom_point(size=3) +
+  labs(
+    x=expression(n),
+    y="Minimal ESS",
+    color="",
+    shape=""
+  ) +
+  scale_color_manual(values=c("ULA true posterior"="black", "ULA surrogate posterior"="red", "HMC"="blue")) +
+  scale_shape_manual(values=c("ULA true posterior"=16, "ULA surrogate posterior"=17, "HMC"=15)) +
+  theme_minimal() +
+  theme(panel.border = element_rect(colour="black", fill=NA),
+        axis.title = element_text(size=25),
+        axis.text = element_text(size=20),
+        legend.text = element_text(size=20)) +
+  scale_y_continuous(breaks=c(0, 500, 1000, 1500, 2000), limits=c(500, 2000)) +
+  scale_x_continuous(breaks=c(200, 400, 600, 800, 1000), limits=c(200, 1000))
+
+min_ESS_plot
+ggsave("min_ESS_n.pdf", plot=min_ESS_plot, width = 10, height = 4, units = "in", dpi = 300)
+```
+
+
+Credible interval widths
+```{r}
+round(ula_stats[,4] - ula_stats[,3], 2)
+round(ula_surr_stats[,4] - ula_surr_stats[,3], 2)
+round(hmc_stats[,4] - hmc_stats[,3], 2)
+```
